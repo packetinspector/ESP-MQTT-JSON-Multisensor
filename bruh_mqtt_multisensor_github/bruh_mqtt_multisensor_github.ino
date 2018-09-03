@@ -19,38 +19,46 @@
       - Adafruit unified sensor
       - PubSubClient
       - ArduinoJSON
-	  
+      
   UPDATE 16 MAY 2017 by Knutella - Fixed MQTT disconnects when wifi drops by moving around Reconnect and adding a software reset of MCU
-	           
+               
   UPDATE 23 MAY 2017 - The MQTT_MAX_PACKET_SIZE parameter may not be setting appropriately do to a bug in the PubSub library. If the MQTT messages are not being transmitted as expected please you may need to change the MQTT_MAX_PACKET_SIZE parameter in "PubSubClient.h" directly.
+
+  UPDATE - Added HA Disc and changed to FASTLed -PI
+  removed auth for mqtt
+  wemos mini
 
 */
 
 
 
 #include <ESP8266WiFi.h>
+#include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include "FastLED.h"
+FASTLED_USING_NAMESPACE
 
 
 
 /************ WIFI and MQTT INFORMATION (CHANGE THESE FOR YOUR SETUP) ******************/
-#define wifi_ssid "YourSSID" //type your WIFI information inside the quotes
-#define wifi_password "YourWIFIpassword"
-#define mqtt_server "your.mqtt.server.ip"
-#define mqtt_user "yourMQTTusername" 
-#define mqtt_password "yourMQTTpassword"
+#define wifi_ssid "yourSSID" //type your WIFI information inside the quotes
+#define wifi_password "yourSSIDPass"
+#define mqtt_server "mqtt-server"
+#define mqtt_user "not-used" 
+#define mqtt_password "not-used"
 #define mqtt_port 1883
 
 
 
 /************* MQTT TOPICS (change these topics as you wish)  **************************/
-#define light_state_topic "bruh/sensornode1"
-#define light_set_topic "bruh/sensornode1/set"
+#define light_state_topic "multisensor/node1"
+#define light_set_topic "multisensor/node1/set"
+#define ha_discovery_prefix "homeassistant"
 
 const char* on_cmd = "ON";
 const char* off_cmd = "OFF";
@@ -59,20 +67,23 @@ const char* off_cmd = "OFF";
 
 /**************************** FOR OTA **************************************************/
 #define SENSORNAME "sensornode1"
-#define OTApassword "YouPassword" // change this to whatever password you want to use when you upload OTA
+#define OTApassword "otapass" // change this to whatever password you want to use when you upload OTA
 int OTAport = 8266;
 
 
 
 /**************************** PIN DEFINITIONS ********************************************/
-const int redPin = D1;
-const int greenPin = D2;
-const int bluePin = D3;
-#define PIRPIN    D5
-#define DHTPIN    D7
+#define PIRPIN    D2
+#define DHTPIN    D3
 #define DHTTYPE   DHT22
 #define LDRPIN    A0
 
+/**************************** LED DEFINITIONS ********************************************/
+#define NUM_LEDS 1
+#define LED_DATA_PIN D7
+#define LED_TYPE    WS2812
+#define LED_COLOR_ORDER RGB
+CRGB leds[NUM_LEDS];
 
 
 /**************************** SENSOR DEFINITIONS *******************************************/
@@ -89,7 +100,7 @@ float humValue;
 
 int pirValue;
 int pirStatus;
-String motionStatus;
+String motionStatus = "OFF";
 
 char message_buff[100];
 
@@ -146,6 +157,9 @@ void setup() {
   pinMode(DHTPIN, INPUT);
   pinMode(LDRPIN, INPUT);
 
+  // FASTLED
+  FastLED.addLeds<LED_TYPE,LED_DATA_PIN,LED_COLOR_ORDER>(leds, NUM_LEDS);
+
   Serial.begin(115200);
   delay(10);
 
@@ -192,6 +206,7 @@ void setup() {
   Serial.print("IPess: ");
   Serial.println(WiFi.localIP());
   reconnect();
+  hadiscover();
 }
 
 
@@ -344,13 +359,14 @@ void sendState() {
   color["r"] = red;
   color["g"] = green;
   color["b"] = blue;
-
-
   root["brightness"] = brightness;
-  root["humidity"] = (String)humValue;
+  // Temp Validation
+  if (humValue > 1) {
+      root["humidity"] = (String)humValue;
+      root["temperature"] = (String)tempValue;
+  }
   root["motion"] = (String)motionStatus;
   root["ldr"] = (String)LDR;
-  root["temperature"] = (String)tempValue;
   root["heatIndex"] = (String)calculateHeatIndex(humValue, tempValue);
 
 
@@ -389,10 +405,11 @@ float calculateHeatIndex(float humidity, float temp) {
 
 /********************************** START SET COLOR *****************************************/
 void setColor(int inR, int inG, int inB) {
-  analogWrite(redPin, inR);
-  analogWrite(greenPin, inG);
-  analogWrite(bluePin, inB);
-
+  
+  for(int i=0;i<NUM_LEDS;i++){
+      leds[i].setRGB(inR, inG, inB);
+  }
+  FastLED.show();
   Serial.println("Setting LEDs:");
   Serial.print("r: ");
   Serial.print(inR);
@@ -410,7 +427,8 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect(SENSORNAME, mqtt_user, mqtt_password)) {
+    // if (client.connect(SENSORNAME, mqtt_user, mqtt_password)) {
+    if (client.connect(SENSORNAME)) {
       Serial.println("connected");
       client.subscribe(light_set_topic);
       setColor(0, 0, 0);
@@ -425,7 +443,101 @@ void reconnect() {
   }
 }
 
+/********************************** HA Discovery*******************************************/
+void hadiscover() {
+    hadiscoverLight();
+    hadiscoverHumid();
+    hadiscoverTemp();
+    hadiscoverLDR();
+    hadiscoverMotion();
+    sendState();
+}
 
+void hadiscoverHumid() {
+    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+    JsonObject& root = jsonBuffer.createObject();
+    String haconfigMessage;
+
+    root["name"] = String(SENSORNAME) + " Humidity";
+    root["state_topic"] = light_state_topic;
+    root["unit_of_measurement"] = "%";
+    root["device_class"] = "humidity";
+    root["value_template"] = "{{ value_json.humidity | round(1) }}";
+    root.printTo(haconfigMessage);
+
+    String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "h/config";
+    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscoverTemp() {
+    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+    JsonObject& root = jsonBuffer.createObject();
+    String haconfigMessage;
+
+    root["name"] = String(SENSORNAME) + " Temperature";
+    root["state_topic"] = light_state_topic;
+    root["unit_of_measurement"] = "F";
+    root["device_class"] = "temperature";
+    root["value_template"] = "{{ value_json.temperature | round(1) }}";
+    root.printTo(haconfigMessage);
+
+    String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "t/config";
+    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscoverLDR() {
+    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+    JsonObject& root = jsonBuffer.createObject();
+    String haconfigMessage;
+
+    root["name"] = String(SENSORNAME) + " LDR";
+    root["state_topic"] = light_state_topic;
+    root["unit_of_measurement"] = "LUX";
+    root["device_class"] = "illuminance";
+    root["value_template"] = "{{ value_json.ldr }}";
+    root.printTo(haconfigMessage);
+
+    String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "l/config";
+    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscoverMotion() {
+    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+    JsonObject& root = jsonBuffer.createObject();
+    String haconfigMessage;
+
+    root["name"] = String(SENSORNAME) + " Motion";
+    root["state_topic"] = light_state_topic;
+    root["device_class"] = "motion";
+    root["value_template"] = "{{ value_json.motion }}";
+    root.printTo(haconfigMessage);
+
+    String haconfigTopic = String(ha_discovery_prefix) + "/binary_sensor/" + String(SENSORNAME) + "m/config";
+    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscoverLight() {
+    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+    JsonObject& root = jsonBuffer.createObject();
+    String haconfigMessage;
+
+    // Message for light
+    root["name"] = String(SENSORNAME) + " led";
+    root["platform"] = "mqtt_json";
+    root["state_topic"] = light_state_topic;
+    root["command_topic"] = light_set_topic;
+    root["brightness"] = "true";
+    root["flash"] = "true";
+    root["rgb"] = "true";
+    root["optimistic"] = "false";
+    root["qos"] = 0;
+    // Put in string
+    root.printTo(haconfigMessage);
+    // Set MQ topic
+    String haconfigTopic = String(ha_discovery_prefix) + "/light/" + String(SENSORNAME) + "/config";
+    // Publish!
+    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
 
 /********************************** START CHECK SENSOR **********************************/
 bool checkBoundSensor(float newValue, float prevValue, float maxDiff) {
@@ -448,18 +560,23 @@ void loop() {
 
     float newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses  
     float newHumValue = dht.readHumidity();
+    if (newHumValue < 1) {
+        // Try again
+        newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses  
+        newHumValue = dht.readHumidity();
+    }
 
     //PIR CODE
     pirValue = digitalRead(PIRPIN); //read state of the
 
     if (pirValue == LOW && pirStatus != 1) {
-      motionStatus = "standby";
+      motionStatus = "OFF";
       sendState();
       pirStatus = 1;
     }
 
     else if (pirValue == HIGH && pirStatus != 2) {
-      motionStatus = "motion detected";
+      motionStatus = "ON";
       sendState();
       pirStatus = 2;
     }
