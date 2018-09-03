@@ -44,7 +44,6 @@
 FASTLED_USING_NAMESPACE
 
 
-
 /************ WIFI and MQTT INFORMATION (CHANGE THESE FOR YOUR SETUP) ******************/
 #define wifi_ssid "yourSSID" //type your WIFI information inside the quotes
 #define wifi_password "yourSSIDPass"
@@ -52,8 +51,6 @@ FASTLED_USING_NAMESPACE
 #define mqtt_user "not-used" 
 #define mqtt_password "not-used"
 #define mqtt_port 1883
-
-
 
 /************* MQTT TOPICS (change these topics as you wish)  **************************/
 #define light_state_topic "multisensor/node1"
@@ -63,14 +60,10 @@ FASTLED_USING_NAMESPACE
 const char* on_cmd = "ON";
 const char* off_cmd = "OFF";
 
-
-
 /**************************** FOR OTA **************************************************/
 #define SENSORNAME "sensornode1"
 #define OTApassword "otapass" // change this to whatever password you want to use when you upload OTA
 int OTAport = 8266;
-
-
 
 /**************************** PIN DEFINITIONS ********************************************/
 #define PIRPIN    D2
@@ -84,7 +77,6 @@ int OTAport = 8266;
 #define LED_TYPE    WS2812
 #define LED_COLOR_ORDER RGB
 CRGB leds[NUM_LEDS];
-
 
 /**************************** SENSOR DEFINITIONS *******************************************/
 float ldrValue;
@@ -104,7 +96,7 @@ String motionStatus = "OFF";
 
 char message_buff[100];
 
-int calibrationTime = 0;
+int calibrationTime = 1;
 
 const int BUFFER_SIZE = 300;
 
@@ -159,6 +151,8 @@ void setup() {
 
   // FASTLED
   FastLED.addLeds<LED_TYPE,LED_DATA_PIN,LED_COLOR_ORDER>(leds, NUM_LEDS);
+  // Set to Red during setup
+  FastLED.showColor(CRGB(200,0,0)); 
 
   Serial.begin(115200);
   delay(10);
@@ -177,7 +171,8 @@ void setup() {
 
   Serial.println("Starting Node named " + String(SENSORNAME));
 
-
+  // Set to Blue while connecting
+  FastLED.showColor(CRGB(0,0,200));
   setup_wifi();
 
   client.setServer(mqtt_server, mqtt_port);
@@ -207,6 +202,10 @@ void setup() {
   Serial.println(WiFi.localIP());
   reconnect();
   hadiscover();
+  FastLED.showColor(CRGB(0,200,0));
+  delay(1000);
+  // Turn LED off
+  FastLED.show(0);
 }
 
 
@@ -406,10 +405,7 @@ float calculateHeatIndex(float humidity, float temp) {
 /********************************** START SET COLOR *****************************************/
 void setColor(int inR, int inG, int inB) {
   
-  for(int i=0;i<NUM_LEDS;i++){
-      leds[i].setRGB(inR, inG, inB);
-  }
-  FastLED.show();
+  FastLED.showColor(CRGB(inR, inG, inB));
   Serial.println("Setting LEDs:");
   Serial.print("r: ");
   Serial.print(inR);
