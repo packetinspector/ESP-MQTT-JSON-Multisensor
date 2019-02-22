@@ -28,9 +28,10 @@
   removed auth for mqtt
   wemos mini
 
+  UPDATE - 
+  Change for HA new mqtt json schema
+
 */
-
-
 
 #include <ESP8266WiFi.h>
 #include <Adafruit_Sensor.h>
@@ -42,7 +43,6 @@
 #include <ArduinoJson.h>
 #include "FastLED.h"
 FASTLED_USING_NAMESPACE
-
 
 /************ WIFI and MQTT INFORMATION (CHANGE THESE FOR YOUR SETUP) ******************/
 #define wifi_ssid "yourSSID" //type your WIFI information inside the quotes
@@ -57,8 +57,8 @@ FASTLED_USING_NAMESPACE
 #define light_set_topic "multisensor/node1/set"
 #define ha_discovery_prefix "homeassistant"
 
-const char* on_cmd = "ON";
-const char* off_cmd = "OFF";
+const char *on_cmd = "ON";
+const char *off_cmd = "OFF";
 
 /**************************** FOR OTA **************************************************/
 #define SENSORNAME "sensornode1"
@@ -66,15 +66,15 @@ const char* off_cmd = "OFF";
 int OTAport = 8266;
 
 /**************************** PIN DEFINITIONS ********************************************/
-#define PIRPIN    D2
-#define DHTPIN    D3
-#define DHTTYPE   DHT22
-#define LDRPIN    A0
+#define PIRPIN D2
+#define DHTPIN D3
+#define DHTTYPE DHT22
+#define LDRPIN A0
 
 /**************************** LED DEFINITIONS ********************************************/
 #define NUM_LEDS 1
 #define LED_DATA_PIN D7
-#define LED_TYPE    WS2812
+#define LED_TYPE WS2812
 #define LED_COLOR_ORDER RGB
 CRGB leds[NUM_LEDS];
 
@@ -101,7 +101,6 @@ int calibrationTime = 1;
 const int BUFFER_SIZE = 300;
 
 #define MQTT_MAX_PACKET_SIZE 512
-
 
 /******************************** GLOBALS for fade/flash *******************************/
 byte red = 255;
@@ -132,183 +131,219 @@ byte flashGreen = green;
 byte flashBlue = blue;
 byte flashBrightness = brightness;
 
-
-
 WiFiClient espClient;
 PubSubClient client(espClient);
 DHT dht(DHTPIN, DHTTYPE);
 
-
-
-/********************************** START SETUP*****************************************/
-void setup() {
-
-  Serial.begin(115200);
-
-  pinMode(PIRPIN, INPUT);
-  pinMode(DHTPIN, INPUT);
-  pinMode(LDRPIN, INPUT);
-
-  // FASTLED
-  FastLED.addLeds<LED_TYPE,LED_DATA_PIN,LED_COLOR_ORDER>(leds, NUM_LEDS);
-  // Set to Red during setup
-  FastLED.showColor(CRGB(200,0,0)); 
-
-  Serial.begin(115200);
-  delay(10);
-
-  ArduinoOTA.setPort(OTAport);
-
-  ArduinoOTA.setHostname(SENSORNAME);
-
-  ArduinoOTA.setPassword((const char *)OTApassword);
-
-  Serial.print("calibrating sensor ");
-  for (int i = 0; i < calibrationTime; i++) {
-    Serial.print(".");
-    delay(1000);
+/*
+ * Calculate Heat Index value AKA "Real Feel"
+ * NOAA heat index calculations taken from
+ * http://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
+ */
+float calculateHeatIndex(float humidity, float temp)
+{
+  float heatIndex = 0;
+  if (temp >= 80)
+  {
+    heatIndex = -42.379 + 2.04901523 * temp + 10.14333127 * humidity;
+    heatIndex = heatIndex - .22475541 * temp * humidity - .00683783 * temp * temp;
+    heatIndex = heatIndex - .05481717 * humidity * humidity + .00122874 * temp * temp * humidity;
+    heatIndex = heatIndex + .00085282 * temp * humidity * humidity - .00000199 * temp * temp * humidity * humidity;
+  }
+  else
+  {
+    heatIndex = 0.5 * (temp + 61.0 + ((temp - 68.0) * 1.2) + (humidity * 0.094));
   }
 
-  Serial.println("Starting Node named " + String(SENSORNAME));
+  if (humidity < 13 && 80 <= temp <= 112)
+  {
+    float adjustment = ((13 - humidity) / 4) * sqrt((17 - abs(temp - 95.)) / 17);
+    heatIndex = heatIndex - adjustment;
+  }
 
-  // Set to Blue while connecting
-  FastLED.showColor(CRGB(0,0,200));
-  setup_wifi();
-
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback);
-
-
-  ArduinoOTA.onStart([]() {
-    Serial.println("Starting");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
-  ArduinoOTA.begin();
-  Serial.println("Ready");
-  Serial.print("IPess: ");
-  Serial.println(WiFi.localIP());
-  reconnect();
-  hadiscover();
-  FastLED.showColor(CRGB(0,200,0));
-  delay(1000);
-  // Turn LED off
-  FastLED.show(0);
+  return heatIndex;
 }
 
+/********************************** START SEND STATE*****************************************/
+void sendState()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
 
+  JsonObject &root = jsonBuffer.createObject();
 
-
-/********************************** START SETUP WIFI*****************************************/
-void setup_wifi() {
-
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(wifi_ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  root["state"] = (stateOn) ? on_cmd : off_cmd;
+  JsonObject &color = root.createNestedObject("color");
+  color["r"] = red;
+  color["g"] = green;
+  color["b"] = blue;
+  root["brightness"] = brightness;
+  // Temp Validation
+  if (humValue > 1)
+  {
+    root["humidity"] = (String)humValue;
+    root["temperature"] = (String)tempValue;
   }
+  root["motion"] = (String)motionStatus;
+  root["ldr"] = (String)LDR;
+  root["heatIndex"] = (String)calculateHeatIndex(humValue, tempValue);
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  char buffer[root.measureLength() + 1];
+  root.printTo(buffer, sizeof(buffer));
+
+  Serial.println(buffer);
+  client.publish(light_state_topic, buffer, true);
 }
 
+/********************************** HA Discovery*******************************************/
+void hadiscoverHumid()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  JsonObject &root = jsonBuffer.createObject();
+  String haconfigMessage;
 
+  root["name"] = String(SENSORNAME) + " Humidity";
+  root["state_topic"] = light_state_topic;
+  root["unit_of_measurement"] = "%";
+  root["device_class"] = "humidity";
+  root["value_template"] = "{{ value_json.humidity | round(1) }}";
+  root.printTo(haconfigMessage);
 
-/********************************** START CALLBACK*****************************************/
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
+  String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "h/config";
+  client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
 
-  char message[length + 1];
-  for (int i = 0; i < length; i++) {
-    message[i] = (char)payload[i];
-  }
-  message[length] = '\0';
-  Serial.println(message);
+void hadiscoverTemp()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  JsonObject &root = jsonBuffer.createObject();
+  String haconfigMessage;
 
-  if (!processJson(message)) {
-    return;
-  }
+  root["name"] = String(SENSORNAME) + " Temperature";
+  root["state_topic"] = light_state_topic;
+  root["unit_of_measurement"] = "F";
+  root["device_class"] = "temperature";
+  root["value_template"] = "{{ value_json.temperature | round(1) }}";
+  root.printTo(haconfigMessage);
 
-  if (stateOn) {
-    // Update lights
-    realRed = map(red, 0, 255, 0, brightness);
-    realGreen = map(green, 0, 255, 0, brightness);
-    realBlue = map(blue, 0, 255, 0, brightness);
-  }
-  else {
-    realRed = 0;
-    realGreen = 0;
-    realBlue = 0;
-  }
+  String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "t/config";
+  client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
 
-  startFade = true;
-  inFade = false; // Kill the current fade
+void hadiscoverLDR()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  JsonObject &root = jsonBuffer.createObject();
+  String haconfigMessage;
 
+  root["name"] = String(SENSORNAME) + " LDR";
+  root["state_topic"] = light_state_topic;
+  root["unit_of_measurement"] = "LUX";
+  root["device_class"] = "illuminance";
+  root["value_template"] = "{{ value_json.ldr }}";
+  root.printTo(haconfigMessage);
+
+  String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "l/config";
+  client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscoverMotion()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  JsonObject &root = jsonBuffer.createObject();
+  String haconfigMessage;
+
+  root["name"] = String(SENSORNAME) + " Motion";
+  root["state_topic"] = light_state_topic;
+  root["device_class"] = "motion";
+  root["value_template"] = "{{ value_json.motion }}";
+  root.printTo(haconfigMessage);
+
+  String haconfigTopic = String(ha_discovery_prefix) + "/binary_sensor/" + String(SENSORNAME) + "m/config";
+  client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscoverLight()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  JsonObject &root = jsonBuffer.createObject();
+  String haconfigMessage;
+
+  // Message for light
+  root["name"] = String(SENSORNAME) + " led";
+  root["platform"] = "mqtt";
+  root["schema"] = "json";
+  root["state_topic"] = light_state_topic;
+  root["command_topic"] = light_set_topic;
+  root["brightness"] = "true";
+  // root["flash"] = "true";
+  root["rgb"] = "true";
+  root["optimistic"] = "false";
+  root["qos"] = 0;
+  // Put in string
+  root.printTo(haconfigMessage);
+  // Set MQ topic
+  String haconfigTopic = String(ha_discovery_prefix) + "/light/" + String(SENSORNAME) + "/config";
+  // Publish!
+  client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
+}
+
+void hadiscover()
+{
+  hadiscoverLight();
+  hadiscoverHumid();
+  hadiscoverTemp();
+  hadiscoverLDR();
+  hadiscoverMotion();
   sendState();
 }
 
-
-
 /********************************** START PROCESS JSON*****************************************/
-bool processJson(char* message) {
+bool processJson(char *message)
+{
   StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
 
-  JsonObject& root = jsonBuffer.parseObject(message);
+  JsonObject &root = jsonBuffer.parseObject(message);
 
-  if (!root.success()) {
+  if (!root.success())
+  {
     Serial.println("parseObject() failed");
     return false;
   }
 
-  if (root.containsKey("state")) {
-    if (strcmp(root["state"], on_cmd) == 0) {
+  if (root.containsKey("state"))
+  {
+    if (strcmp(root["state"], on_cmd) == 0)
+    {
       stateOn = true;
     }
-    else if (strcmp(root["state"], off_cmd) == 0) {
+    else if (strcmp(root["state"], off_cmd) == 0)
+    {
       stateOn = false;
     }
   }
 
   // If "flash" is included, treat RGB and brightness differently
-  if (root.containsKey("flash")) {
+  if (root.containsKey("flash"))
+  {
     flashLength = (int)root["flash"] * 1000;
 
-    if (root.containsKey("brightness")) {
+    if (root.containsKey("brightness"))
+    {
       flashBrightness = root["brightness"];
     }
-    else {
+    else
+    {
       flashBrightness = brightness;
     }
 
-    if (root.containsKey("color")) {
+    if (root.containsKey("color"))
+    {
       flashRed = root["color"]["r"];
       flashGreen = root["color"]["g"];
       flashBlue = root["color"]["b"];
     }
-    else {
+    else
+    {
       flashRed = red;
       flashGreen = green;
       flashBlue = blue;
@@ -321,23 +356,28 @@ bool processJson(char* message) {
     flash = true;
     startFlash = true;
   }
-  else { // Not flashing
+  else
+  { // Not flashing
     flash = false;
 
-    if (root.containsKey("color")) {
+    if (root.containsKey("color"))
+    {
       red = root["color"]["r"];
       green = root["color"]["g"];
       blue = root["color"]["b"];
     }
 
-    if (root.containsKey("brightness")) {
+    if (root.containsKey("brightness"))
+    {
       brightness = root["brightness"];
     }
 
-    if (root.containsKey("transition")) {
+    if (root.containsKey("transition"))
+    {
       transitionTime = root["transition"];
     }
-    else {
+    else
+    {
       transitionTime = 0;
     }
   }
@@ -345,66 +385,76 @@ bool processJson(char* message) {
   return true;
 }
 
+/********************************** START SETUP WIFI*****************************************/
+void setup_wifi()
+{
 
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(wifi_ssid);
+  // Set Hostname
+  WiFi.hostname(SENSORNAME);
 
-/********************************** START SEND STATE*****************************************/
-void sendState() {
-  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
 
-  JsonObject& root = jsonBuffer.createObject();
-
-  root["state"] = (stateOn) ? on_cmd : off_cmd;
-  JsonObject& color = root.createNestedObject("color");
-  color["r"] = red;
-  color["g"] = green;
-  color["b"] = blue;
-  root["brightness"] = brightness;
-  // Temp Validation
-  if (humValue > 1) {
-      root["humidity"] = (String)humValue;
-      root["temperature"] = (String)tempValue;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
   }
-  root["motion"] = (String)motionStatus;
-  root["ldr"] = (String)LDR;
-  root["heatIndex"] = (String)calculateHeatIndex(humValue, tempValue);
 
-
-  char buffer[root.measureLength() + 1];
-  root.printTo(buffer, sizeof(buffer));
-
-  Serial.println(buffer);
-  client.publish(light_state_topic, buffer, true);
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
 }
 
+/********************************** START CALLBACK*****************************************/
+void callback(char *topic, byte *payload, unsigned int length)
+{
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
 
-/*
- * Calculate Heat Index value AKA "Real Feel"
- * NOAA heat index calculations taken from
- * http://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
- */
-float calculateHeatIndex(float humidity, float temp) {
-  float heatIndex= 0;
-  if (temp >= 80) {
-    heatIndex = -42.379 + 2.04901523*temp + 10.14333127*humidity;
-    heatIndex = heatIndex - .22475541*temp*humidity - .00683783*temp*temp;
-    heatIndex = heatIndex - .05481717*humidity*humidity + .00122874*temp*temp*humidity;
-    heatIndex = heatIndex + .00085282*temp*humidity*humidity - .00000199*temp*temp*humidity*humidity;
-  } else {
-     heatIndex = 0.5 * (temp + 61.0 + ((temp - 68.0)*1.2) + (humidity * 0.094));
+  char message[length + 1];
+  for (int i = 0; i < length; i++)
+  {
+    message[i] = (char)payload[i];
+  }
+  message[length] = '\0';
+  Serial.println(message);
+
+  if (!processJson(message))
+  {
+    return;
   }
 
-  if (humidity < 13 && 80 <= temp <= 112) {
-     float adjustment = ((13-humidity)/4) * sqrt((17-abs(temp-95.))/17);
-     heatIndex = heatIndex - adjustment;
+  if (stateOn)
+  {
+    // Update lights
+    realRed = map(red, 0, 255, 0, brightness);
+    realGreen = map(green, 0, 255, 0, brightness);
+    realBlue = map(blue, 0, 255, 0, brightness);
+  }
+  else
+  {
+    realRed = 0;
+    realGreen = 0;
+    realBlue = 0;
   }
 
-  return heatIndex;
+  startFade = true;
+  inFade = false; // Kill the current fade
+
+  sendState();
 }
-
 
 /********************************** START SET COLOR *****************************************/
-void setColor(int inR, int inG, int inB) {
-  
+void setColor(int inR, int inG, int inB)
+{
+
   FastLED.showColor(CRGB(inR, inG, inB));
   Serial.println("Setting LEDs:");
   Serial.print("r: ");
@@ -415,21 +465,24 @@ void setColor(int inR, int inG, int inB) {
   Serial.println(inB);
 }
 
-
-
 /********************************** START RECONNECT*****************************************/
-void reconnect() {
+void reconnect()
+{
   // Loop until we're reconnected
-  while (!client.connected()) {
+  while (!client.connected())
+  {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
     // if (client.connect(SENSORNAME, mqtt_user, mqtt_password)) {
-    if (client.connect(SENSORNAME)) {
+    if (client.connect(SENSORNAME))
+    {
       Serial.println("connected");
       client.subscribe(light_set_topic);
       setColor(0, 0, 0);
       sendState();
-    } else {
+    }
+    else
+    {
       Serial.print("failed, rc=");
       Serial.print(client.state());
       Serial.println(" try again in 5 seconds");
@@ -439,139 +492,174 @@ void reconnect() {
   }
 }
 
-/********************************** HA Discovery*******************************************/
-void hadiscover() {
-    hadiscoverLight();
-    hadiscoverHumid();
-    hadiscoverTemp();
-    hadiscoverLDR();
-    hadiscoverMotion();
-    sendState();
-}
-
-void hadiscoverHumid() {
-    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
-    JsonObject& root = jsonBuffer.createObject();
-    String haconfigMessage;
-
-    root["name"] = String(SENSORNAME) + " Humidity";
-    root["state_topic"] = light_state_topic;
-    root["unit_of_measurement"] = "%";
-    root["device_class"] = "humidity";
-    root["value_template"] = "{{ value_json.humidity | round(1) }}";
-    root.printTo(haconfigMessage);
-
-    String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "h/config";
-    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
-}
-
-void hadiscoverTemp() {
-    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
-    JsonObject& root = jsonBuffer.createObject();
-    String haconfigMessage;
-
-    root["name"] = String(SENSORNAME) + " Temperature";
-    root["state_topic"] = light_state_topic;
-    root["unit_of_measurement"] = "F";
-    root["device_class"] = "temperature";
-    root["value_template"] = "{{ value_json.temperature | round(1) }}";
-    root.printTo(haconfigMessage);
-
-    String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "t/config";
-    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
-}
-
-void hadiscoverLDR() {
-    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
-    JsonObject& root = jsonBuffer.createObject();
-    String haconfigMessage;
-
-    root["name"] = String(SENSORNAME) + " LDR";
-    root["state_topic"] = light_state_topic;
-    root["unit_of_measurement"] = "LUX";
-    root["device_class"] = "illuminance";
-    root["value_template"] = "{{ value_json.ldr }}";
-    root.printTo(haconfigMessage);
-
-    String haconfigTopic = String(ha_discovery_prefix) + "/sensor/" + String(SENSORNAME) + "l/config";
-    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
-}
-
-void hadiscoverMotion() {
-    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
-    JsonObject& root = jsonBuffer.createObject();
-    String haconfigMessage;
-
-    root["name"] = String(SENSORNAME) + " Motion";
-    root["state_topic"] = light_state_topic;
-    root["device_class"] = "motion";
-    root["value_template"] = "{{ value_json.motion }}";
-    root.printTo(haconfigMessage);
-
-    String haconfigTopic = String(ha_discovery_prefix) + "/binary_sensor/" + String(SENSORNAME) + "m/config";
-    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
-}
-
-void hadiscoverLight() {
-    StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
-    JsonObject& root = jsonBuffer.createObject();
-    String haconfigMessage;
-
-    // Message for light
-    root["name"] = String(SENSORNAME) + " led";
-    root["platform"] = "mqtt_json";
-    root["state_topic"] = light_state_topic;
-    root["command_topic"] = light_set_topic;
-    root["brightness"] = "true";
-    root["flash"] = "true";
-    root["rgb"] = "true";
-    root["optimistic"] = "false";
-    root["qos"] = 0;
-    // Put in string
-    root.printTo(haconfigMessage);
-    // Set MQ topic
-    String haconfigTopic = String(ha_discovery_prefix) + "/light/" + String(SENSORNAME) + "/config";
-    // Publish!
-    client.publish(haconfigTopic.c_str(), haconfigMessage.c_str(), true);
-}
-
 /********************************** START CHECK SENSOR **********************************/
-bool checkBoundSensor(float newValue, float prevValue, float maxDiff) {
+bool checkBoundSensor(float newValue, float prevValue, float maxDiff)
+{
   return newValue < prevValue - maxDiff || newValue > prevValue + maxDiff;
 }
 
+/********************************** Helpers **********************************/
+int calculateStep(int prevValue, int endValue)
+{
+  int step = endValue - prevValue; // What's the overall gap?
+  if (step)
+  {                     // If its non-zero,
+    step = 1020 / step; //   divide by 1020
+  }
+
+  return step;
+}
+
+/* The next function is calculateVal. When the loop value, i,
+   reaches the step size appropriate for one of the
+   colors, it increases or decreases the value of that color by 1.
+   (R, G, and B are each calculated separately.)
+*/
+int calculateVal(int step, int val, int i)
+{
+  if ((step) && i % step == 0)
+  { // If step is non-zero and its time to change a value,
+    if (step > 0)
+    { //   increment the value if step is positive...
+      val += 1;
+    }
+    else if (step < 0)
+    { //   ...or decrement it if step is negative
+      val -= 1;
+    }
+  }
+
+  // Defensive driving: make sure val stays in the range 0-255
+  if (val > 255)
+  {
+    val = 255;
+  }
+  else if (val < 0)
+  {
+    val = 0;
+  }
+
+  return val;
+}
+
+/****reset***/
+void software_Reset() // Restarts program from beginning but does not reset the peripherals and registers
+{
+  Serial.print("resetting");
+  ESP.reset();
+}
+
+/********************************** START SETUP*****************************************/
+void setup()
+{
+
+  Serial.begin(115200);
+
+  pinMode(PIRPIN, INPUT);
+  pinMode(DHTPIN, INPUT);
+  pinMode(LDRPIN, INPUT);
+
+  // FASTLED
+  FastLED.addLeds<LED_TYPE, LED_DATA_PIN, LED_COLOR_ORDER>(leds, NUM_LEDS);
+  // Set to Red during setup
+  FastLED.showColor(CRGB(200, 0, 0));
+
+  Serial.begin(115200);
+  delay(10);
+
+  ArduinoOTA.setPort(OTAport);
+
+  ArduinoOTA.setHostname(SENSORNAME);
+
+  ArduinoOTA.setPassword((const char *)OTApassword);
+
+  Serial.print("calibrating sensor ");
+  for (int i = 0; i < calibrationTime; i++)
+  {
+    Serial.print(".");
+    delay(1000);
+  }
+
+  Serial.println("Starting Node named " + String(SENSORNAME));
+
+  // Set to Blue while connecting
+  FastLED.showColor(CRGB(0, 0, 200));
+  setup_wifi();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("Starting");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR)
+      Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR)
+      Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR)
+      Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR)
+      Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR)
+      Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("Ready");
+  Serial.print("IPess: ");
+  Serial.println(WiFi.localIP());
+  reconnect();
+  hadiscover();
+  FastLED.showColor(CRGB(0, 200, 0));
+  delay(1000);
+  // Turn LED off
+  FastLED.show(0);
+}
 
 /********************************** START MAIN LOOP***************************************/
-void loop() {
+void loop()
+{
 
   ArduinoOTA.handle();
-  
-  if (!client.connected()) {
+
+  if (!client.connected())
+  {
     // reconnect();
     software_Reset();
   }
   client.loop();
 
-  if (!inFade) {
+  if (!inFade)
+  {
 
-    float newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses  
+    float newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses
     float newHumValue = dht.readHumidity();
-    if (newHumValue < 1) {
-        // Try again
-        newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses  
-        newHumValue = dht.readHumidity();
+    if (newHumValue < 1)
+    {
+      // Try again
+      newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses
+      newHumValue = dht.readHumidity();
     }
 
     //PIR CODE
     pirValue = digitalRead(PIRPIN); //read state of the
 
-    if (pirValue == LOW && pirStatus != 1) {
+    if (pirValue == LOW && pirStatus != 1)
+    {
       motionStatus = "OFF";
       sendState();
       pirStatus = 1;
     }
 
-    else if (pirValue == HIGH && pirStatus != 2) {
+    else if (pirValue == HIGH && pirStatus != 2)
+    {
       motionStatus = "ON";
       sendState();
       pirStatus = 2;
@@ -579,52 +667,61 @@ void loop() {
 
     delay(100);
 
-    if (checkBoundSensor(newTempValue, tempValue, diffTEMP)) {
+    if (checkBoundSensor(newTempValue, tempValue, diffTEMP))
+    {
       tempValue = newTempValue;
       sendState();
     }
 
-    if (checkBoundSensor(newHumValue, humValue, diffHUM)) {
+    if (checkBoundSensor(newHumValue, humValue, diffHUM))
+    {
       humValue = newHumValue;
       sendState();
     }
 
-
     int newLDR = analogRead(LDRPIN);
 
-    if (checkBoundSensor(newLDR, LDR, diffLDR)) {
+    if (checkBoundSensor(newLDR, LDR, diffLDR))
+    {
       LDR = newLDR;
       sendState();
     }
-
   }
 
-  if (flash) {
-    if (startFlash) {
+  if (flash)
+  {
+    if (startFlash)
+    {
       startFlash = false;
       flashStartTime = millis();
     }
 
-    if ((millis() - flashStartTime) <= flashLength) {
-      if ((millis() - flashStartTime) % 1000 <= 500) {
+    if ((millis() - flashStartTime) <= flashLength)
+    {
+      if ((millis() - flashStartTime) % 1000 <= 500)
+      {
         setColor(flashRed, flashGreen, flashBlue);
       }
-      else {
+      else
+      {
         setColor(0, 0, 0);
         // If you'd prefer the flashing to happen "on top of"
         // the current color, uncomment the next line.
         // setColor(realRed, realGreen, realBlue);
       }
     }
-    else {
+    else
+    {
       flash = false;
       setColor(realRed, realGreen, realBlue);
     }
   }
 
-  if (startFade) {
+  if (startFade)
+  {
     // If we don't want to fade, skip it.
-    if (transitionTime == 0) {
+    if (transitionTime == 0)
+    {
       setColor(realRed, realGreen, realBlue);
 
       redVal = realRed;
@@ -633,7 +730,8 @@ void loop() {
 
       startFade = false;
     }
-    else {
+    else
+    {
       loopCount = 0;
       stepR = calculateStep(redVal, realRed);
       stepG = calculateStep(grnVal, realGreen);
@@ -643,11 +741,14 @@ void loop() {
     }
   }
 
-  if (inFade) {
+  if (inFade)
+  {
     startFade = false;
     unsigned long now = millis();
-    if (now - lastLoop > transitionTime) {
-      if (loopCount <= 1020) {
+    if (now - lastLoop > transitionTime)
+    {
+      if (loopCount <= 1020)
+      {
         lastLoop = now;
 
         redVal = calculateVal(stepR, redVal, loopCount);
@@ -660,84 +761,11 @@ void loop() {
         Serial.println(loopCount);
         loopCount++;
       }
-      else {
+      else
+      {
         inFade = false;
       }
     }
   }
 }
 
-
-
-
-/**************************** START TRANSITION FADER *****************************************/
-// From https://www.arduino.cc/en/Tutorial/ColorCrossfader
-/* BELOW THIS LINE IS THE MATH -- YOU SHOULDN'T NEED TO CHANGE THIS FOR THE BASICS
-
-  The program works like this:
-  Imagine a crossfade that moves the red LED from 0-10,
-    the green from 0-5, and the blue from 10 to 7, in
-    ten steps.
-    We'd want to count the 10 steps and increase or
-    decrease color values in evenly stepped increments.
-    Imagine a + indicates raising a value by 1, and a -
-    equals lowering it. Our 10 step fade would look like:
-
-    1 2 3 4 5 6 7 8 9 10
-  R + + + + + + + + + +
-  G   +   +   +   +   +
-  B     -     -     -
-
-  The red rises from 0 to 10 in ten steps, the green from
-  0-5 in 5 steps, and the blue falls from 10 to 7 in three steps.
-
-  In the real program, the color percentages are converted to
-  0-255 values, and there are 1020 steps (255*4).
-
-  To figure out how big a step there should be between one up- or
-  down-tick of one of the LED values, we call calculateStep(),
-  which calculates the absolute gap between the start and end values,
-  and then divides that gap by 1020 to determine the size of the step
-  between adjustments in the value.
-*/
-int calculateStep(int prevValue, int endValue) {
-  int step = endValue - prevValue; // What's the overall gap?
-  if (step) {                      // If its non-zero,
-    step = 1020 / step;          //   divide by 1020
-  }
-
-  return step;
-}
-
-/* The next function is calculateVal. When the loop value, i,
-   reaches the step size appropriate for one of the
-   colors, it increases or decreases the value of that color by 1.
-   (R, G, and B are each calculated separately.)
-*/
-int calculateVal(int step, int val, int i) {
-  if ((step) && i % step == 0) { // If step is non-zero and its time to change a value,
-    if (step > 0) {              //   increment the value if step is positive...
-      val += 1;
-    }
-    else if (step < 0) {         //   ...or decrement it if step is negative
-      val -= 1;
-    }
-  }
-
-  // Defensive driving: make sure val stays in the range 0-255
-  if (val > 255) {
-    val = 255;
-  }
-  else if (val < 0) {
-    val = 0;
-  }
-
-  return val;
-}
-
-/****reset***/
-void software_Reset() // Restarts program from beginning but does not reset the peripherals and registers
-{
-Serial.print("resetting");
-ESP.reset(); 
-}
